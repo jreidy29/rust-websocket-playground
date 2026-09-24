@@ -7,6 +7,17 @@ use tokio::net::{TcpListener, TcpStream};
 
 const DELIM: &[u8] = b"\r\n\r\n";
 const MAGIC_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const FIN_BIT: u8 = 0b1000_0000;
+const OPCODE_MASK: u8 = 0b0000_1111;
+const MASK_BIT: u8 = 0b1000_0000;
+const LENGTH_MASK: u8 = 0b0111_1111;
+
+#[derive(Debug, Default)]
+struct Frame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
 
 fn compute_accept_key(client_key: &str) -> String {
     let mut hasher = Sha1::new();
@@ -58,13 +69,97 @@ async fn send_handshake_response(socket: &mut TcpStream, accept_key: &str) -> io
     socket.write_all(response.as_bytes()).await
 }
 
+async fn read_frame(socket: &mut TcpStream) -> io::Result<Frame> {
+    // frame header parse
+    let mut frame_header = [0u8; 2];
+    socket.read_exact(&mut frame_header).await?;
+    let mut frame = Frame {
+        fin: frame_header[0] & 0x80 != 0,
+        opcode: frame_header[0] & 0x0F,
+        payload: vec![],
+    };
+    let mask_flag: bool = frame_header[1] & 0x80 != 0;
+
+    // content length
+    let u8_length = frame_header[1] & 0x7f;
+    let payload_size: usize = if u8_length == 126 {
+        let mut u16_bit_buf = [0u8; 2];
+        socket.read_exact(&mut u16_bit_buf).await?;
+        u16::from_be_bytes(u16_bit_buf) as usize
+    } else if u8_length == 127 {
+        let mut u64_bit_buf = [0u8; 8];
+        socket.read_exact(&mut u64_bit_buf).await?;
+        u64::from_be_bytes(u64_bit_buf) as usize
+    } else {
+        u8_length as usize
+    };
+    let mut payload_buf: Vec<u8> = vec![0; payload_size];
+    socket.read_exact(&mut payload_buf).await?;
+
+    // unmasking
+    let mut mask = [0u8; 4];
+    if mask_flag {
+        socket.read_exact(&mut mask).await?;
+    }
+    for i in 0..payload_size {
+        payload_buf[i] ^= mask[i % 4]
+    }
+    frame.payload = payload_buf;
+    Ok(frame)
+}
+
+async fn write_frame(socket: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    let mut result: Vec<u8> = vec![0b1000_0001];
+    println!("result: {:?}", result);
+
+    let payload_length = payload.len() as usize;
+    if payload_length <= 125 {
+        result.push(payload_length as u8);
+        println!("result: {:?}", result);
+    } else if payload_length <= 65535 {
+        result.push(126 as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push(payload_length as u8);
+        println!("result: {:?}", result);
+    } else {
+        result.push(127 as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push((payload_length >> 8) as u8);
+        // first 4 bytes above last 4 below
+        result.push((payload_length >> 8) as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push((payload_length >> 8) as u8);
+        result.push(payload_length as u8);
+        println!("result: {:?}", result);
+    };
+    result.extend_from_slice(payload);
+    println!("result: {:?}", result);
+    socket.write_all(&result).await?;
+    Ok(())
+}
+
 async fn handle_socket(socket: &mut TcpStream) -> io::Result<()> {
     let headers = process_headers(socket).await?;
     let accept_key = compute_accept_key(
         &extract_websocket_key(&headers)
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Request was malformed"))?,
     );
-    send_handshake_response(socket, &accept_key).await
+    send_handshake_response(socket, &accept_key).await?;
+    // loop {
+    //     let frame = read_frame(socket).await?;
+    //     match frame.opcode {
+    //         1 => write_frame(socket, frame.opcode, &frame.payload).await?,
+    //         _ => {
+    //             break;
+    //         }
+    //     }
+    // }
+    let debug_frame = read_frame(socket).await?;
+    println!("{:#?}", debug_frame);
+    write_frame(socket, debug_frame.opcode, &debug_frame.payload).await?;
+    Ok(())
 }
 
 #[tokio::main]
