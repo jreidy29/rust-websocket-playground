@@ -74,14 +74,19 @@ async fn read_frame(socket: &mut TcpStream) -> io::Result<Frame> {
     let mut frame_header = [0u8; 2];
     socket.read_exact(&mut frame_header).await?;
     let mut frame = Frame {
-        fin: frame_header[0] & 0x80 != 0,
-        opcode: frame_header[0] & 0x0F,
+        fin: frame_header[0] & FIN_BIT != 0,
+        opcode: frame_header[0] & OPCODE_MASK,
         payload: vec![],
     };
-    let mask_flag: bool = frame_header[1] & 0x80 != 0;
+    let mask_flag: bool = frame_header[1] & MASK_BIT != 0;
+    // unmasking
+    let mut mask = [0u8; 4];
+    if mask_flag {
+        socket.read_exact(&mut mask).await?;
+    }
 
     // content length
-    let u8_length = frame_header[1] & 0x7f;
+    let u8_length = frame_header[1] & LENGTH_MASK;
     let payload_size: usize = if u8_length == 126 {
         let mut u16_bit_buf = [0u8; 2];
         socket.read_exact(&mut u16_bit_buf).await?;
@@ -96,11 +101,6 @@ async fn read_frame(socket: &mut TcpStream) -> io::Result<Frame> {
     let mut payload_buf: Vec<u8> = vec![0; payload_size];
     socket.read_exact(&mut payload_buf).await?;
 
-    // unmasking
-    let mut mask = [0u8; 4];
-    if mask_flag {
-        socket.read_exact(&mut mask).await?;
-    }
     for i in 0..payload_size {
         payload_buf[i] ^= mask[i % 4]
     }
@@ -109,30 +109,17 @@ async fn read_frame(socket: &mut TcpStream) -> io::Result<Frame> {
 }
 
 async fn write_frame(socket: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut result: Vec<u8> = vec![0b1000_0001];
-    println!("result: {:?}", result);
+    let mut result: Vec<u8> = vec![FIN_BIT | opcode];
 
     let payload_length = payload.len() as usize;
     if payload_length <= 125 {
         result.push(payload_length as u8);
-        println!("result: {:?}", result);
     } else if payload_length <= 65535 {
         result.push(126 as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push(payload_length as u8);
-        println!("result: {:?}", result);
+        result.extend((payload_length as u16).to_be_bytes());
     } else {
         result.push(127 as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push((payload_length >> 8) as u8);
-        // first 4 bytes above last 4 below
-        result.push((payload_length >> 8) as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push((payload_length >> 8) as u8);
-        result.push(payload_length as u8);
-        println!("result: {:?}", result);
+        result.extend((payload_length as u64).to_be_bytes());
     };
     result.extend_from_slice(payload);
     println!("result: {:?}", result);
@@ -147,18 +134,31 @@ async fn handle_socket(socket: &mut TcpStream) -> io::Result<()> {
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Request was malformed"))?,
     );
     send_handshake_response(socket, &accept_key).await?;
-    // loop {
-    //     let frame = read_frame(socket).await?;
-    //     match frame.opcode {
-    //         1 => write_frame(socket, frame.opcode, &frame.payload).await?,
-    //         _ => {
-    //             break;
-    //         }
-    //     }
-    // }
-    let debug_frame = read_frame(socket).await?;
-    println!("{:#?}", debug_frame);
-    write_frame(socket, debug_frame.opcode, &debug_frame.payload).await?;
+    loop {
+        let frame = read_frame(socket).await?;
+        match frame.opcode {
+            0x1 => {
+                let text = std::str::from_utf8(&frame.payload).map_err(|_| {
+                    Error::new(ErrorKind::InvalidData, "invalid utf8 in text frame")
+                })?;
+                println!("received: {}", text);
+                write_frame(socket, 0x1, &frame.payload).await?; // echo for now
+            }
+            0x2 => {
+                println!("received binary frame, {} bytes", frame.payload.len());
+                write_frame(socket, 0x2, &frame.payload).await?;
+            }
+            0x8 => {
+                println!("received close signal {:?}", frame);
+                write_frame(socket, 0x8, &frame.payload).await?;
+                break;
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -170,7 +170,9 @@ async fn main() -> io::Result<()> {
         let (mut socket, _) = listener.accept().await?;
 
         tokio::spawn(async move {
-            let _ = handle_socket(&mut socket).await;
+            if let Err(e) = handle_socket(&mut socket).await {
+                println!("connection ended {:?}", e);
+            }
         });
     }
 }
